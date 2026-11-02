@@ -1,16 +1,21 @@
 import os
 import base64
 import json
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from flask import Flask, request
+from google import genai
+from google.genai import types
+import requests
 
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
+
+# Initialize the official Gemini client with your key
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 def get_google_credentials():
     scope = [
@@ -27,8 +32,8 @@ def get_google_credentials():
 
 def get_google_sheet():
     creds = get_google_credentials()
-    client = gspread.authorize(creds)
-    return client.open(GOOGLE_SHEET_NAME).sheet1
+    gspread_client = gspread.authorize(creds)
+    return gspread_client.open(GOOGLE_SHEET_NAME).sheet1
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
@@ -48,50 +53,31 @@ def telegram_webhook():
             voice_file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
             voice_bytes = requests.get(voice_file_url).content
             
-            # 2. Convert audio bytes to Base64
-            audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
+            # 2. Call Gemini using the official SDK (passing audio bytes directly)
+            prompt_text = (
+                "Listen to this voice note from a logistics agent. Extract the following fields strictly as a text summary "
+                "separated by commas: Container Number, Current Location/Port, Status Update. "
+                "Do not add extra conversational text."
+            )
             
-            # 3. Call Gemini API using the project API key query parameter
-            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
-            
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {
-                                "inline_data": {
-                                    "mime_type": "audio/ogg",
-                                    "data": audio_base64
-                                }
-                            },
-                            {
-                                "text": (
-                                    "Listen to this voice note from a logistics agent. Extract the following fields strictly as a text summary "
-                                    "separated by commas: Container Number, Current Location/Port, Status Update. "
-                                    "Do not add extra conversational text."
-                                )
-                            }
-                        ]
-                    }
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[
+                    types.Part.from_bytes(
+                        data=voice_bytes,
+                        mime_type='audio/ogg',
+                    ),
+                    prompt_text
                 ]
-            }
+            )
             
-            headers = {
-                "Content-Type": "application/json"
-            }
+            extracted_data = response.text.strip()
             
-            gen_resp = requests.post(generate_url, headers=headers, json=payload).json()
-            
-            if "candidates" not in gen_resp:
-                raise Exception(f"Gemini API Error: {gen_resp}")
-                
-            extracted_data = gen_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
-            
-            # 4. Log to Google Sheets
+            # 3. Log to Google Sheets
             sheet = get_google_sheet()
             sheet.append_row([str(chat_id), extracted_data])
             
-            # 5. Reply back on Telegram
+            # 4. Reply back on Telegram
             reply_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(reply_url, json={
                 "chat_id": chat_id, 
