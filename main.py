@@ -73,9 +73,11 @@ def telegram_webhook():
                 ]
             }
             
-            headers = {"Content-Type": "application/json"}
-            gen_resp = requests.post(generate_url, headers=headers, json=payload).json()
-            
+            headers = {
+    "Authorization": f"Bearer {GEMINI_API_KEY}",
+    "Content-Type": "application/json"
+}
+
             if "candidates" not in gen_resp:
                 raise Exception(f"Gemini API Error: {gen_resp}")
                 
