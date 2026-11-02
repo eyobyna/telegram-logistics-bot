@@ -4,19 +4,18 @@ import json
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-import google.auth.transport.requests
 from flask import Flask, request
 
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_API_KEY")  # matches your Render variable name
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
 def get_google_credentials():
     scope = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/generative-language"
+        "https://www.googleapis.com/auth/drive"
     ]
     creds_json_str = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json_str:
@@ -25,12 +24,6 @@ def get_google_credentials():
     else:
         creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
     return creds
-
-def get_oauth_token():
-    creds = get_google_credentials()
-    auth_req = google.auth.transport.requests.Request()
-    creds.refresh(auth_req)
-    return creds.token
 
 def get_google_sheet():
     creds = get_google_credentials()
@@ -58,9 +51,8 @@ def telegram_webhook():
             # 2. Convert audio bytes to Base64
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            # 3. Get fresh OAuth token and call Gemini API via REST (using gemini-3.8-flash)
-            access_token = get_oauth_token()
-            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+            # 3. Call Gemini API using standard API key parameter (gemini-3.8-flash)
+            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
             
             payload = {
                 "contents": [
@@ -85,7 +77,6 @@ def telegram_webhook():
             }
             
             headers = {
-                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
             
