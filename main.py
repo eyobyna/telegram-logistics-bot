@@ -11,11 +11,10 @@ import requests
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
-# Initialize the official Gemini client with your key
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize the official Gemini client using your exact Render variable name
+client = genai.Client(api_key=os.environ.get("CUSTOM_GEMINI_API_KEY"))
 
 def get_google_credentials():
     scope = [
