@@ -13,17 +13,11 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
-# --- HARDCODED API KEY WORKAROUND ---
-# Paste your full AQ... key inside the quotes below:
-gemini_key = "AQ.Ab8RN6LbnfJ2cY-G0FYq-lyw4T3lcSKYPGqvPpPX5H8GzqVRiw"
-
-# Initialize the official Gemini client with the direct key
-client = genai.Client(api_key=gemini_key)
-
 def get_google_credentials():
     scope = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/cloud-platform"
     ]
     creds_json_str = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json_str:
@@ -33,8 +27,17 @@ def get_google_credentials():
         creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
     return creds
 
+# Initialize Gemini using Vertex AI mode with your Service Account credentials
+# This bypasses API keys completely by using your GCP project credentials
+creds = get_google_credentials()
+client = genai.Client(
+    vertexai=True,
+    project="830239826159",  # Your GCP project number from earlier
+    location="us-central1",
+    credentials=creds
+)
+
 def get_google_sheet():
-    creds = get_google_credentials()
     gspread_client = gspread.authorize(creds)
     return gspread_client.open(GOOGLE_SHEET_NAME).sheet1
 
@@ -56,7 +59,7 @@ def telegram_webhook():
             voice_file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
             voice_bytes = requests.get(voice_file_url).content
             
-            # 2. Call Gemini using the official SDK (passing audio bytes directly)
+            # 2. Call Gemini via Vertex AI SDK
             prompt_text = (
                 "Listen to this voice note from a logistics agent. Extract the following fields strictly as a text summary "
                 "separated by commas: Container Number, Current Location/Port, Status Update. "
