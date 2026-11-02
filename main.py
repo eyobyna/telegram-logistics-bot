@@ -16,7 +16,7 @@ def get_google_credentials():
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/cloud-platform"
+        "https://www.googleapis.com/auth/generative-language"
     ]
     creds_json_str = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json_str:
@@ -58,7 +58,7 @@ def telegram_webhook():
             # 2. Convert audio bytes to Base64
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            # 3. Get fresh OAuth token and call Gemini API via REST
+            # 3. Get fresh OAuth token with correct scope and call Gemini API via REST
             access_token = get_oauth_token()
             generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             
