@@ -1,4 +1,5 @@
 import os
+import base64
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -44,60 +45,42 @@ def telegram_webhook():
             voice_file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
             voice_bytes = requests.get(voice_file_url).content
             
-            temp_audio_path = "voice_note.ogg"
-            with open(temp_audio_path, "wb") as f:
-                f.write(voice_bytes)
-                
-            # 2. Upload file to Gemini using Bearer token authentication
-            headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
-            file_size = os.path.getsize(temp_audio_path)
+            # 2. Convert audio bytes to Base64 for inline processing
+            audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            init_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-            init_headers = {
-                **headers,
-                "X-Goog-Upload-Protocol": "resumable",
-                "X-Goog-Upload-Command": "start",
-                "X-Goog-Upload-Header-Content-Length": str(file_size),
-                "X-Goog-Upload-Header-Content-Type": "audio/ogg",
-                "Content-Type": "application/json"
-            }
-            init_resp = requests.post(init_url, headers=init_headers, json={"file": {"display_name": "voice_note.ogg"}}).headers
-            upload_url = init_resp.get("X-Goog-Upload-URL")
+            # 3. Call Gemini 1.5 Flash with inline audio data
+            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
             
-            upload_headers = {
-                **headers,
-                "X-Goog-Upload-Command": "upload, finalize",
-                "X-Goog-Upload-Offset": "0",
-                "Content-Length": str(file_size)
-            }
-            with open(temp_audio_path, "rb") as audio_f:
-                upload_resp = requests.post(upload_url, headers=upload_headers, data=audio_f).json()
-            
-            file_name = upload_resp.get("file", {}).get("name")
-            
-            # 3. Generate content via direct REST API
-            prompt = (
-                "Listen to this voice note from a logistics agent. Extract the following fields strictly as a text summary "
-                "separated by commas: Container Number, Current Location/Port, Status Update. "
-                "Do not add extra conversational text."
-            )
-            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             payload = {
                 "contents": [
                     {
                         "parts": [
-                            {"file_data": {"file_uri": f"https://generativelanguage.googleapis.com/v1beta/{file_name}", "mime_type": "audio/ogg"}},
-                            {"text": prompt}
+                            {
+                                "inline_data": {
+                                    "mime_type": "audio/ogg",
+                                    "data": audio_base64
+                                }
+                            },
+                            {
+                                "text": (
+                                    "Listen to this voice note from a logistics agent. Extract the following fields strictly as a text summary "
+                                    "separated by commas: Container Number, Current Location/Port, Status Update. "
+                                    "Do not add extra conversational text."
+                                )
+                            }
                         ]
                     }
                 ]
             }
-            gen_resp = requests.post(generate_url, headers={**headers, "Content-Type": "application/json"}, json=payload).json()
+            
+            headers = {"Content-Type": "application/json"}
+            gen_resp = requests.post(generate_url, headers=headers, json=payload).json()
+            
+            if "candidates" not in gen_resp:
+                raise Exception(f"Gemini API Error: {gen_resp}")
+                
             extracted_data = gen_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
             
-            if os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
-                
             # 4. Log to Google Sheets
             sheet = get_google_sheet()
             sheet.append_row([str(chat_id), extracted_data])
