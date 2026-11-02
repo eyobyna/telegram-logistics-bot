@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -8,7 +9,7 @@ from flask import Flask, request
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_TOKEN")
+GEMINI_TOKEN = os.environ.get("CUSTOM_GEMINI_TOKEN") or os.environ.get("GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
 def get_google_sheet():
@@ -18,7 +19,6 @@ def get_google_sheet():
     ]
     creds_json_str = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json_str:
-        import json
         creds_dict = json.loads(creds_json_str)
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     else:
@@ -48,9 +48,9 @@ def telegram_webhook():
             # 2. Convert audio bytes to Base64 for inline processing
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            # 3. Call Gemini 1.5 Flash with inline audio data
-            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
-
+            # 3. Call Gemini 1.5 Flash via direct REST API with Bearer token
+            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+            
             payload = {
                 "contents": [
                     {
@@ -74,10 +74,12 @@ def telegram_webhook():
             }
             
             headers = {
-    "Authorization": f"Bearer {GEMINI_API_KEY}",
-    "Content-Type": "application/json"
-}
-
+                "Authorization": f"Bearer {GEMINI_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            gen_resp = requests.post(generate_url, headers=headers, json=payload).json()
+            
             if "candidates" not in gen_resp:
                 raise Exception(f"Gemini API Error: {gen_resp}")
                 
@@ -99,7 +101,7 @@ def telegram_webhook():
             reply_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(reply_url, json={
                 "chat_id": chat_id, 
-                "text": f"Error processing update: {str(e)}"
+                "text": f"Error processing update: {str(s := str(e))}"
             })
             
     return "OK", 200
