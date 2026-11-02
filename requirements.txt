@@ -2,3 +2,4 @@ Flask
 requests
 gspread
 google-auth
+google-genai
