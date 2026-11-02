@@ -9,7 +9,7 @@ from flask import Flask, request
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_API_KEY")  # matches your Render variable name
+GEMINI_API_KEY = os.environ.get("CUSTOM_GEMINI_API_KEY")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
 def get_google_credentials():
@@ -51,7 +51,7 @@ def telegram_webhook():
             # 2. Convert audio bytes to Base64
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            # 3. Call Gemini API using standard API key parameter (gemini-3.8-flash)
+            # 3. Call Gemini API using the project API key query parameter
             generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
             
             payload = {
