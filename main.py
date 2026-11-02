@@ -49,8 +49,8 @@ def telegram_webhook():
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
             # 3. Call Gemini 1.5 Flash with inline audio data
-            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-            
+            generate_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+
             payload = {
                 "contents": [
                     {
