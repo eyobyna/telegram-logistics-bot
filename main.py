@@ -13,8 +13,19 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Logistics_Tracking")
 
-# Initialize the official Gemini client using your exact Render variable name
-client = genai.Client(api_key=os.environ.get("CUSTOM_GEMINI_API_KEY"))
+# Check multiple potential environment variable names to prevent None errors
+gemini_key = (
+    os.environ.get("CUSTOM_GEMINI_API_KEY") or 
+    os.environ.get("GEMINI_API_KEY") or 
+    os.environ.get("CUSTOM_GEMINI_KEY")
+)
+
+if not gemini_key:
+    print("CRITICAL WARNING: No Gemini API key found in environment variables!")
+    print("Available environment variables:", list(os.environ.keys()))
+
+# Initialize the official Gemini client safely
+client = genai.Client(api_key=gemini_key)
 
 def get_google_credentials():
     scope = [
