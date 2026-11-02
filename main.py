@@ -58,9 +58,9 @@ def telegram_webhook():
             # 2. Convert audio bytes to Base64
             audio_base64 = base64.b64encode(voice_bytes).decode("utf-8")
             
-            # 3. Get fresh OAuth token and call Gemini API via REST (using gemini-2.5-flash)
+            # 3. Get fresh OAuth token and call Gemini API via REST (using gemini-3.8-flash)
             access_token = get_oauth_token()
-            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
             
             payload = {
                 "contents": [
@@ -94,7 +94,7 @@ def telegram_webhook():
             if "candidates" not in gen_resp:
                 raise Exception(f"Gemini API Error: {gen_resp}")
                 
-            extracted_data = gen_resps = gen_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+            extracted_data = gen_resp["candidates"][0]["content"]["parts"][0]["text"].strip()
             
             # 4. Log to Google Sheets
             sheet = get_google_sheet()
