@@ -62,7 +62,7 @@ def telegram_webhook():
             
             # 3. Get fresh token from Service Account and call Gemini Developer API
             access_token = get_gemini_access_token()
-            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+            generate_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
             
             payload = {
                 "contents": [
