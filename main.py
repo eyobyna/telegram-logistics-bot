@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ import gspread
 import requests
 from flask import Flask, abort, jsonify, request
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel
 
@@ -50,6 +52,7 @@ GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
@@ -232,6 +235,43 @@ def classify_message(message):
 # --------------------------------------------------------------------------- #
 # Gemini extraction
 # --------------------------------------------------------------------------- #
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
+RETRY_DELAYS = [3, 8, 15]  # seconds to wait between attempts
+
+
+def generate_with_retry(contents):
+    """
+    Call Gemini, retrying temporary errors (e.g. 503 'model is overloaded').
+    If GEMINI_FALLBACK_MODEL is set, it is tried after the main model.
+    """
+    config = types.GenerateContentConfig(
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=LogisticsExtraction,
+    )
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+
+    last_exc = None
+    for model in models:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return get_gemini_client().models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except genai_errors.APIError as exc:
+                last_exc = exc
+                if getattr(exc, "code", None) not in RETRYABLE_CODES:
+                    raise
+                log.warning(
+                    "Gemini %s error on %s (attempt %d)", exc.code, model, attempt + 1
+                )
+                if attempt < len(RETRY_DELAYS):
+                    time.sleep(RETRY_DELAYS[attempt])
+    raise last_exc
+
+
 def extract_logistics_data(inp, media_bytes=None):
     contents = [EXTRACTION_PROMPT]
 
@@ -242,15 +282,7 @@ def extract_logistics_data(inp, media_bytes=None):
         if inp.get("caption"):
             contents.append("Sender's caption: " + inp["caption"])
 
-    response = get_gemini_client().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0,
-            response_mime_type="application/json",
-            response_schema=LogisticsExtraction,
-        ),
-    )
+    response = generate_with_retry(contents)
     if not response.text:
         raise RuntimeError("Gemini returned an empty response")
 
@@ -381,11 +413,21 @@ def process_update(update):
 
     except Exception as exc:
         log.exception("Failed to process %s for chat %s", inp.get("kind"), chat_id)
-        send_message(
-            chat_id,
-            "❌ Sorry, I couldn't process that. Please try again.\n"
-            f"(Error type: {type(exc).__name__})",
-        )
+        if (
+            isinstance(exc, genai_errors.APIError)
+            and getattr(exc, "code", None) in RETRYABLE_CODES
+        ):
+            send_message(
+                chat_id,
+                "⏳ The AI service is very busy right now. "
+                "Please send that again in a minute.",
+            )
+        else:
+            send_message(
+                chat_id,
+                "❌ Sorry, I couldn't process that. Please try again.\n"
+                f"(Error type: {type(exc).__name__})",
+            )
 
 
 # --------------------------------------------------------------------------- #
