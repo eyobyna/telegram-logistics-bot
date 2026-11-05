@@ -1,9 +1,9 @@
 """
-Telegram logistics voice-note bot.
+Telegram logistics bot (voice notes, text messages, photos/scans, PDFs).
 
-Flow: Telegram webhook -> download voice note -> Gemini extracts
-(container number, location/port, status) -> append row to Google Sheet
--> confirmation reply via Telegram.
+Flow: Telegram webhook -> read the input (voice / text / photo / image or PDF
+document) -> Gemini extracts (container number, location/port, status)
+-> append row(s) to Google Sheet -> confirmation reply via Telegram.
 
 Required env vars:
     TELEGRAM_BOT_TOKEN       Bot token from @BotFather
@@ -25,6 +25,7 @@ import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import List
 
 import gspread
 import requests
@@ -56,39 +57,55 @@ ALLOWED_CHAT_IDS = {
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
+MAX_FILE_BYTES = 18 * 1024 * 1024  # keep under Gemini's ~20 MB inline limit
+MAX_RECORDS = 50
+
 SHEET_HEADERS = [
     "Timestamp (UTC)",
     "Telegram Chat ID",
     "Container Number",
     "Current Location/Port",
     "Status Update",
+    "Input Type",
 ]
 
 EXTRACTION_PROMPT = """You are a logistics data-entry assistant.
-Listen to the attached voice note from a logistics operator and extract
-strictly these three fields:
+The input is one of: a voice note, a typed message, or a photo/scan/PDF of a
+paper document (for example a delivery order, bill of lading, gate pass,
+inspection sheet, handwritten note, or shipping update).
+
+Extract strictly these three fields for each container:
 
 1. container_number: The shipping container number (typically 4 letters
    followed by 7 digits, e.g. MSKU1234567). Remove spaces and hyphens and
-   use uppercase. If several containers are mentioned, list them separated
-   by commas.
+   use uppercase.
 2. location: The current location or port mentioned (e.g. "Port of Djibouti",
-   "Modjo dry port").
+   "Modjo dry port"). For documents, use the current/last known location,
+   or the port named on the document if no current location is given.
 3. status_update: A clean, concise text summary of the status update
-   (what is happening with the container: customs clearance, loaded,
-   delayed, in transit, delivered, etc.). Write it as 1-3 plain sentences.
+   (customs clearance, loaded, delayed, in transit, delivered, inspection,
+   etc.). Write it as 1-3 plain sentences.
 
 Rules:
-- Use only information actually spoken in the audio. Never guess or invent.
-- If a field is not mentioned, return exactly "Not mentioned".
-- The audio may be in any language; always write the output in English.
+- Use only information actually present in the input. Never guess or invent.
+- If a field is not present for a container, return exactly "Not mentioned".
+- If several containers appear, return one record per container.
+- If the input mentions a status or location but no container number,
+  return one record with container_number "Not mentioned".
+- If the input contains no logistics information at all, return an empty
+  records list.
+- The input may be in any language; always write the output in English.
 """
 
 
-class LogisticsData(BaseModel):
+class LogisticsRecord(BaseModel):
     container_number: str
     location: str
     status_update: str
+
+
+class LogisticsExtraction(BaseModel):
+    records: List[LogisticsRecord]
 
 
 # --------------------------------------------------------------------------- #
@@ -151,50 +168,160 @@ def download_telegram_file(file_id):
 
 
 # --------------------------------------------------------------------------- #
+# Input classification
+# --------------------------------------------------------------------------- #
+def classify_message(message):
+    """
+    Work out what the user sent. Returns a dict with:
+      kind:    Voice | Audio | Photo | Document | Text | Unsupported
+      file_id, mime, size, caption (for file inputs) or text (for text input)
+    or None when there is nothing to process.
+    """
+    caption = (message.get("caption") or "").strip()
+
+    if message.get("voice"):
+        m = message["voice"]
+        return {
+            "kind": "Voice",
+            "file_id": m["file_id"],
+            "mime": "audio/ogg",
+            "size": m.get("file_size"),
+            "caption": caption,
+        }
+
+    if message.get("audio"):
+        m = message["audio"]
+        return {
+            "kind": "Audio",
+            "file_id": m["file_id"],
+            "mime": m.get("mime_type") or "audio/mpeg",
+            "size": m.get("file_size"),
+            "caption": caption,
+        }
+
+    if message.get("photo"):
+        m = message["photo"][-1]  # largest available size
+        return {
+            "kind": "Photo",
+            "file_id": m["file_id"],
+            "mime": "image/jpeg",
+            "size": m.get("file_size"),
+            "caption": caption,
+        }
+
+    if message.get("document"):
+        m = message["document"]
+        mime = (m.get("mime_type") or "").lower()
+        if mime.startswith("image/") or mime == "application/pdf":
+            return {
+                "kind": "Document",
+                "file_id": m["file_id"],
+                "mime": mime,
+                "size": m.get("file_size"),
+                "caption": caption,
+            }
+        return {"kind": "Unsupported"}
+
+    text = (message.get("text") or "").strip()
+    if text:
+        return {"kind": "Text", "text": text}
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Gemini extraction
 # --------------------------------------------------------------------------- #
-def extract_logistics_data(audio_bytes):
+def extract_logistics_data(inp, media_bytes=None):
+    contents = [EXTRACTION_PROMPT]
+
+    if inp["kind"] == "Text":
+        contents.append("Message text:\n" + inp["text"])
+    else:
+        contents.append(types.Part.from_bytes(data=media_bytes, mime_type=inp["mime"]))
+        if inp.get("caption"):
+            contents.append("Sender's caption: " + inp["caption"])
+
     response = get_gemini_client().models.generate_content(
         model=GEMINI_MODEL,
-        contents=[
-            EXTRACTION_PROMPT,
-            types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(
             temperature=0,
             response_mime_type="application/json",
-            response_schema=LogisticsData,
+            response_schema=LogisticsExtraction,
         ),
     )
     if not response.text:
         raise RuntimeError("Gemini returned an empty response")
 
-    data = json.loads(response.text)
-    return {
-        "container_number": str(data.get("container_number") or "Not mentioned").strip(),
-        "location": str(data.get("location") or "Not mentioned").strip(),
-        "status_update": str(data.get("status_update") or "Not mentioned").strip(),
-    }
+    raw = json.loads(response.text)
+    records = []
+    for item in (raw.get("records") or [])[:MAX_RECORDS]:
+        records.append(
+            {
+                "container_number": str(item.get("container_number") or "Not mentioned").strip(),
+                "location": str(item.get("location") or "Not mentioned").strip(),
+                "status_update": str(item.get("status_update") or "Not mentioned").strip(),
+            }
+        )
+    return records
 
 
 # --------------------------------------------------------------------------- #
 # Sheet logging
 # --------------------------------------------------------------------------- #
-def log_to_sheet(chat_id, data):
-    row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        str(chat_id),
-        data["container_number"],
-        data["location"],
-        data["status_update"],
+def log_to_sheet(chat_id, records, input_type):
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        [
+            timestamp,
+            str(chat_id),
+            r["container_number"],
+            r["location"],
+            r["status_update"],
+            input_type,
+        ]
+        for r in records
     ]
     # RAW stores values as plain text (no formula interpretation).
-    get_worksheet().append_row(row, value_input_option="RAW")
+    get_worksheet().append_rows(rows, value_input_option="RAW")
+
+
+def format_confirmation(records):
+    if len(records) == 1:
+        r = records[0]
+        return (
+            "✅ Logged successfully\n\n"
+            f"Container: {r['container_number']}\n"
+            f"Location/Port: {r['location']}\n"
+            f"Status: {r['status_update']}"
+        )
+
+    lines = [f"✅ Logged {len(records)} entries\n"]
+    for i, r in enumerate(records[:10], start=1):
+        lines.append(
+            f"{i}. {r['container_number']} | {r['location']} | {r['status_update']}"
+        )
+    if len(records) > 10:
+        lines.append(f"...and {len(records) - 10} more (all saved in the sheet).")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 # Update processing (runs in a background thread)
 # --------------------------------------------------------------------------- #
+HELP_TEXT = (
+    "Hi! Send me a logistics update and I'll log it to the sheet.\n\n"
+    "You can send:\n"
+    "• a voice note\n"
+    "• a text message\n"
+    "• a photo or scan of a paper (tip: send it as a File for the sharpest "
+    "result)\n"
+    "• a PDF\n\n"
+    "I extract the container number, current location/port and status."
+)
+
+
 def process_update(update):
     message = update.get("message") or update.get("channel_post") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -205,39 +332,59 @@ def process_update(update):
         log.warning("Ignoring message from unauthorized chat %s", chat_id)
         return
 
-    voice = message.get("voice")
-    audio = message.get("audio")
-    media = voice or audio
-
-    if not media:
-        text = (message.get("text") or "").strip()
-        if text.startswith("/start"):
-            send_message(
-                chat_id,
-                "Hi! Send me a voice note with the container number, "
-                "current location/port and status, and I'll log it.",
-            )
-        elif text:
-            send_message(chat_id, "Please send a voice note (not text) to log an update.")
+    inp = classify_message(message)
+    if inp is None:
         return
 
-    try:
-        send_message(chat_id, "🎧 Got it, processing your voice note...")
-        audio_bytes = download_telegram_file(media["file_id"])
-        data = extract_logistics_data(audio_bytes)
-        log_to_sheet(chat_id, data)
+    if inp["kind"] == "Unsupported":
         send_message(
             chat_id,
-            "✅ Logged successfully\n\n"
-            f"Container: {data['container_number']}\n"
-            f"Location/Port: {data['location']}\n"
-            f"Status: {data['status_update']}",
+            "Sorry, I can only read voice notes, text, photos/images and PDFs.",
         )
-    except Exception:
-        log.exception("Failed to process voice note for chat %s", chat_id)
+        return
+
+    if inp["kind"] == "Text":
+        text = inp["text"]
+        if text.startswith("/start") or text.startswith("/help"):
+            send_message(chat_id, HELP_TEXT)
+            return
+        if text.startswith("/"):
+            return
+
+    try:
+        media_bytes = None
+        if inp["kind"] != "Text":
+            if inp.get("size") and inp["size"] > MAX_FILE_BYTES:
+                send_message(chat_id, "❌ That file is too large (limit is about 18 MB).")
+                return
+            send_message(chat_id, "⏳ Got it, processing...")
+            media_bytes = download_telegram_file(inp["file_id"])
+            if len(media_bytes) > MAX_FILE_BYTES:
+                send_message(chat_id, "❌ That file is too large (limit is about 18 MB).")
+                return
+        else:
+            send_message(chat_id, "⏳ Got it, processing...")
+
+        records = extract_logistics_data(inp, media_bytes)
+
+        if not records:
+            send_message(
+                chat_id,
+                "I couldn't find any container, location or status information "
+                "in that, so nothing was logged. Please try again with a clearer "
+                "voice note, message or scan.",
+            )
+            return
+
+        log_to_sheet(chat_id, records, inp["kind"])
+        send_message(chat_id, format_confirmation(records))
+
+    except Exception as exc:
+        log.exception("Failed to process %s for chat %s", inp.get("kind"), chat_id)
         send_message(
             chat_id,
-            "❌ Sorry, I couldn't process that voice note. Please try again.",
+            "❌ Sorry, I couldn't process that. Please try again.\n"
+            f"(Error type: {type(exc).__name__})",
         )
 
 
@@ -248,7 +395,7 @@ app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 
 # Telegram retries webhooks it thinks failed; remember recent update IDs
-# so the same voice note is never logged twice.
+# so the same message is never logged twice.
 _seen_updates = OrderedDict()
 _seen_lock = threading.Lock()
 _SEEN_MAX = 1000
