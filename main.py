@@ -52,7 +52,7 @@ GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "")
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
@@ -123,7 +123,13 @@ def get_gemini_client():
     global _gemini_client
     with _client_lock:
         if _gemini_client is None:
-            _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+            _gemini_client = genai.Client(
+                api_key=GEMINI_API_KEY,
+                http_options=types.HttpOptions(
+                    timeout=60_000,  # 60 s per request
+                    retry_options=types.HttpRetryOptions(attempts=1),  # we retry ourselves
+                ),
+            )
         return _gemini_client
 
 
@@ -236,7 +242,7 @@ def classify_message(message):
 # Gemini extraction
 # --------------------------------------------------------------------------- #
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
-RETRY_DELAYS = [3, 8, 15]  # seconds to wait between attempts
+RETRY_DELAYS = [3, 8]  # seconds to wait between attempts (per model)
 
 
 def generate_with_retry(contents):
@@ -261,9 +267,12 @@ def generate_with_retry(contents):
                     model=model, contents=contents, config=config
                 )
             except genai_errors.APIError as exc:
-                last_exc = exc
                 if getattr(exc, "code", None) not in RETRYABLE_CODES:
-                    raise
+                    if model == GEMINI_MODEL:
+                        raise
+                    log.warning("Fallback model %s failed: %s", model, exc)
+                    break
+                last_exc = exc
                 log.warning(
                     "Gemini %s error on %s (attempt %d)", exc.code, model, attempt + 1
                 )
