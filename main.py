@@ -1,8 +1,8 @@
 """
-Telegram logistics bot (voice notes, text messages, photos/scans, PDFs).
+Telegram logistics & finance bot (voice notes, text messages, photos/scans, PDFs).
 
-Flow: Telegram webhook -> read the input (voice / text / photo / image or PDF
-document) -> Gemini extracts (container number, location/port, status)
+Flow: Telegram webhook -> read the input -> Gemini extracts logistics data
+and calculates financials (Revenue, VAT, WHT, Expenses, Net Profit) 
 -> append row(s) to Google Sheet -> confirmation reply via Telegram.
 
 Required env vars:
@@ -26,7 +26,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 import gspread
 import requests
@@ -43,7 +43,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("logistics-bot")
+log = logging.getLogger("logistics-finance-bot")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -66,49 +66,57 @@ MAX_RECORDS = 50
 SHEET_HEADERS = [
     "Timestamp (UTC)",
     "Telegram Chat ID",
-    "Container Number",
+    "Container/Job Ref",
+    "Client Name",
+    "Service/Activity Description",
     "Current Location/Port",
+    "Gross Revenue Amount",
+    "Calculated VAT",
+    "Calculated WHT",
+    "Total Expenses",
+    "Net Profit",
     "Status Update",
     "Input Type",
 ]
 
-EXTRACTION_PROMPT = """You are a logistics data-entry assistant.
-The input is one of: a voice note, a typed message, or a photo/scan/PDF of a
-paper document (for example a delivery order, bill of lading, gate pass,
-inspection sheet, handwritten note, or shipping update).
+EXTRACTION_PROMPT = """You are an expert logistics accountant and data-entry assistant for Solomon Zewdu Shipping & Freight Forwarding Company.
+The input is one of: a voice note, a typed message, or a photo/scan/PDF of a paper document (such as an invoice, receipt, waybill, delivery order, bill of lading, gate pass, or financial update).
 
-Extract strictly these three fields for each container:
+For each job/container mentioned or found in the document, extract and calculate the following fields accurately:
 
-1. container_number: The shipping container number (typically 4 letters
-   followed by 7 digits, e.g. MSKU1234567). Remove spaces and hyphens and
-   use uppercase.
-2. location: The current location or port mentioned (e.g. "Port of Djibouti",
-   "Modjo dry port"). For documents, use the current/last known location,
-   or the port named on the document if no current location is given.
-3. status_update: A clean, concise text summary of the status update
-   (customs clearance, loaded, delayed, in transit, delivered, inspection,
-   etc.). Write it as 1-3 plain sentences.
+1. container_number: The shipping container number or job reference (e.g. MSKU1234567, or a job reference string). Use uppercase, remove unnecessary spaces. If none, return "Not mentioned".
+2. client_name: The client or company being billed or served. If not mentioned, return "Not mentioned".
+3. service_description: Short description of the service/activity or expense item.
+4. location: The current location or port mentioned (e.g. "Port of Djibouti", "Modjo dry port", "Addis Ababa"). If none, return "Not mentioned".
+5. gross_revenue: Total gross revenue amount as a numeric value (e.g., 50000). Put 0 if it's purely an expense receipt or not mentioned.
+6. vat: Calculated VAT amount based on standard local tax laws or stated values. Put 0 if not applicable.
+7. witholding_tax: Calculated Withholding Tax (WHT) amount. Put 0 if not applicable.
+8. total_expenses: Total expenses incurred (extracted from receipts/text). Put 0 if none.
+9. net_profit: Net profit calculated as (gross_revenue minus total_expenses minus vat and withholding tax where applicable). Put 0 if it's strictly an expense entry.
+10. status_update: A clean, concise 1-3 sentence summary of the status, financial note, or operational milestone.
 
 Rules:
-- Use only information actually present in the input. Never guess or invent.
-- If a field is not present for a container, return exactly "Not mentioned".
-- If several containers appear, return one record per container.
-- If the input mentions a status or location but no container number,
-  return one record with container_number "Not mentioned".
-- If the input contains no logistics information at all, return an empty
-  records list.
+- Use only information actually present in or calculable from the input. Never guess or invent numbers.
+- If multiple entries or containers appear, return a record for each.
 - The input may be in any language; always write the output in English.
 """
 
 
-class LogisticsRecord(BaseModel):
+class LogisticsFinancialRecord(BaseModel):
     container_number: str
+    client_name: str
+    service_description: str
     location: str
+    gross_revenue: float
+    vat: float
+    witholding_tax: float
+    total_expenses: float
+    net_profit: float
     status_update: str
 
 
-class LogisticsExtraction(BaseModel):
-    records: List[LogisticsRecord]
+class FinancialExtraction(BaseModel):
+    records: List[LogisticsFinancialRecord]
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +135,7 @@ def get_gemini_client():
                 api_key=GEMINI_API_KEY,
                 http_options=types.HttpOptions(
                     timeout=60_000,  # 60 s per request
-                    retry_options=types.HttpRetryOptions(attempts=1),  # we retry ourselves
+                    retry_options=types.HttpRetryOptions(attempts=1),
                 ),
             )
         return _gemini_client
@@ -165,7 +173,6 @@ def send_message(chat_id, text):
 
 
 def download_telegram_file(file_id):
-    """Return the raw bytes of a Telegram file."""
     meta = requests.get(
         f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15
     )
@@ -180,12 +187,6 @@ def download_telegram_file(file_id):
 # Input classification
 # --------------------------------------------------------------------------- #
 def classify_message(message):
-    """
-    Work out what the user sent. Returns a dict with:
-      kind:    Voice | Audio | Photo | Document | Text | Unsupported
-      file_id, mime, size, caption (for file inputs) or text (for text input)
-    or None when there is nothing to process.
-    """
     caption = (message.get("caption") or "").strip()
 
     if message.get("voice"):
@@ -209,7 +210,7 @@ def classify_message(message):
         }
 
     if message.get("photo"):
-        m = message["photo"][-1]  # largest available size
+        m = message["photo"][-1]
         return {
             "kind": "Photo",
             "file_id": m["file_id"],
@@ -242,18 +243,14 @@ def classify_message(message):
 # Gemini extraction
 # --------------------------------------------------------------------------- #
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
-RETRY_DELAYS = [3, 8]  # seconds to wait between attempts (per model)
+RETRY_DELAYS = [3, 8]
 
 
 def generate_with_retry(contents):
-    """
-    Call Gemini, retrying temporary errors (e.g. 503 'model is overloaded').
-    If GEMINI_FALLBACK_MODEL is set, it is tried after the main model.
-    """
     config = types.GenerateContentConfig(
         temperature=0,
         response_mime_type="application/json",
-        response_schema=LogisticsExtraction,
+        response_schema=FinancialExtraction,
     )
     models = [GEMINI_MODEL]
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
@@ -281,7 +278,7 @@ def generate_with_retry(contents):
     raise last_exc
 
 
-def extract_logistics_data(inp, media_bytes=None):
+def extract_logistics_financial_data(inp, media_bytes=None):
     contents = [EXTRACTION_PROMPT]
 
     if inp["kind"] == "Text":
@@ -289,7 +286,7 @@ def extract_logistics_data(inp, media_bytes=None):
     else:
         contents.append(types.Part.from_bytes(data=media_bytes, mime_type=inp["mime"]))
         if inp.get("caption"):
-            contents.append("Sender's caption: " + inp["caption"])
+            contents.append("Sender's caption / notes: " + inp["caption"])
 
     response = generate_with_retry(contents)
     if not response.text:
@@ -301,7 +298,14 @@ def extract_logistics_data(inp, media_bytes=None):
         records.append(
             {
                 "container_number": str(item.get("container_number") or "Not mentioned").strip(),
+                "client_name": str(item.get("client_name") or "Not mentioned").strip(),
+                "service_description": str(item.get("service_description") or "Not mentioned").strip(),
                 "location": str(item.get("location") or "Not mentioned").strip(),
+                "gross_revenue": float(item.get("gross_revenue") or 0.0),
+                "vat": float(item.get("vat") or 0.0),
+                "witholding_tax": float(item.get("witholding_tax") or 0.0),
+                "total_expenses": float(item.get("total_expenses") or 0.0),
+                "net_profit": float(item.get("net_profit") or 0.0),
                 "status_update": str(item.get("status_update") or "Not mentioned").strip(),
             }
         )
@@ -309,7 +313,7 @@ def extract_logistics_data(inp, media_bytes=None):
 
 
 # --------------------------------------------------------------------------- #
-# Sheet logging
+# Sheet logging & formatting
 # --------------------------------------------------------------------------- #
 def log_to_sheet(chat_id, records, input_type):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -318,13 +322,19 @@ def log_to_sheet(chat_id, records, input_type):
             timestamp,
             str(chat_id),
             r["container_number"],
+            r["client_name"],
+            r["service_description"],
             r["location"],
+            r["gross_revenue"],
+            r["vat"],
+            r["witholding_tax"],
+            r["total_expenses"],
+            r["net_profit"],
             r["status_update"],
             input_type,
         ]
         for r in records
     ]
-    # RAW stores values as plain text (no formula interpretation).
     get_worksheet().append_rows(rows, value_input_option="RAW")
 
 
@@ -332,34 +342,36 @@ def format_confirmation(records):
     if len(records) == 1:
         r = records[0]
         return (
-            "✅ Logged successfully\n\n"
-            f"Container: {r['container_number']}\n"
-            f"Location/Port: {r['location']}\n"
+            "✅ Financial & Logistics Record Logged\n\n"
+            f"Ref/Container: {r['container_number']}\n"
+            f"Client: {r['client_name']}\n"
+            f"Service: {r['service_description']}\n"
+            f"Location: {r['location']}\n"
+            f"Revenue: {r['gross_revenue']:,.2f}\n"
+            f"VAT: {r['vat']:,.2f} | WHT: {r['witholding_tax']:,.2f}\n"
+            f"Expenses: {r['total_expenses']:,.2f}\n"
+            f"Net Profit: {r['net_profit']:,.2f}\n"
             f"Status: {r['status_update']}"
         )
 
-    lines = [f"✅ Logged {len(records)} entries\n"]
+    lines = [f"✅ Logged {len(records)} financial entries\n"]
     for i, r in enumerate(records[:10], start=1):
         lines.append(
-            f"{i}. {r['container_number']} | {r['location']} | {r['status_update']}"
+            f"{i}. Ref: {r['container_number']} | Client: {r['client_name']} | Net Profit: {r['net_profit']:,.2f}"
         )
     if len(records) > 10:
-        lines.append(f"...and {len(records) - 10} more (all saved in the sheet).")
+        lines.append(f"...and {len(records) - 10} more rows saved in sheet.")
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# Update processing (runs in a background thread)
+# Update processing
 # --------------------------------------------------------------------------- #
 HELP_TEXT = (
-    "Hi! Send me a logistics update and I'll log it to the sheet.\n\n"
-    "You can send:\n"
-    "• a voice note\n"
-    "• a text message\n"
-    "• a photo or scan of a paper (tip: send it as a File for the sharpest "
-    "result)\n"
-    "• a PDF\n\n"
-    "I extract the container number, current location/port and status."
+    "Solomon Zewdu Shipping - Finance & Operations Bot\n\n"
+    "Send me a voice note, text update, receipt photo, scan, or invoice PDF.\n"
+    "I will automatically extract container numbers, calculate VAT, WHT, "
+    "expenses, and net profit, and record it in the central finance sheet."
 )
 
 
@@ -380,7 +392,7 @@ def process_update(update):
     if inp["kind"] == "Unsupported":
         send_message(
             chat_id,
-            "Sorry, I can only read voice notes, text, photos/images and PDFs.",
+            "Unsupported format. Please send text, voice notes, images/receipts, or PDFs.",
         )
         return
 
@@ -396,24 +408,22 @@ def process_update(update):
         media_bytes = None
         if inp["kind"] != "Text":
             if inp.get("size") and inp["size"] > MAX_FILE_BYTES:
-                send_message(chat_id, "❌ That file is too large (limit is about 18 MB).")
+                send_message(chat_id, "❌ File is too large (limit is 18 MB).")
                 return
-            send_message(chat_id, "⏳ Got it, processing...")
+            send_message(chat_id, "⏳ Processing financial record...")
             media_bytes = download_telegram_file(inp["file_id"])
             if len(media_bytes) > MAX_FILE_BYTES:
-                send_message(chat_id, "❌ That file is too large (limit is about 18 MB).")
+                send_message(chat_id, "❌ File is too large (limit is 18 MB).")
                 return
         else:
-            send_message(chat_id, "⏳ Got it, processing...")
+            send_message(chat_id, "⏳ Processing financial record...")
 
-        records = extract_logistics_data(inp, media_bytes)
+        records = extract_logistics_financial_data(inp, media_bytes)
 
         if not records:
             send_message(
                 chat_id,
-                "I couldn't find any container, location or status information "
-                "in that, so nothing was logged. Please try again with a clearer "
-                "voice note, message or scan.",
+                "Could not extract any logistics or financial details from that input. Please try again.",
             )
             return
 
@@ -428,13 +438,12 @@ def process_update(update):
         ):
             send_message(
                 chat_id,
-                "⏳ The AI service is very busy right now. "
-                "Please send that again in a minute.",
+                "⏳ AI service is busy. Please send your update again shortly.",
             )
         else:
             send_message(
                 chat_id,
-                "❌ Sorry, I couldn't process that. Please try again.\n"
+                "❌ Error processing input. Please try again.\n"
                 f"(Error type: {type(exc).__name__})",
             )
 
@@ -445,8 +454,6 @@ def process_update(update):
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Telegram retries webhooks it thinks failed; remember recent update IDs
-# so the same message is never logged twice.
 _seen_updates = OrderedDict()
 _seen_lock = threading.Lock()
 _SEEN_MAX = 1000
@@ -480,7 +487,6 @@ def webhook():
         return jsonify(ok=True), 200
 
     if not already_seen(update.get("update_id")):
-        # Acknowledge immediately; do the slow work in the background.
         executor.submit(process_update, update)
 
     return jsonify(ok=True), 200
